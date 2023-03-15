@@ -7,6 +7,16 @@ import dataclasses
 from typing import List, Optional
 import math
 import statistics
+import opensoar
+from opensoar import thermals, task
+from opensoar.thermals.flight_phases import FlightPhases
+from opensoar.task import waypoint
+from opensoar.competition.soaringspot import get_info_from_comment_lines
+from opensoar.task.trip import Trip
+from opensoar.task.waypoint import Waypoint
+from opensoar.task.race_task import RaceTask
+from opensoar.task.task import Task
+from scipy import constants
 import pint # unit conversion library
 
 from fastkml import kml
@@ -71,15 +81,20 @@ def get_conversion_factor(unit):
     """Gets a conversion factor from metres per second (or simple metres) to whatever your heart desires"""
     # I bet there's a conversion library that would be better for this, but wtf, I can't find one
     if unit in ["kts", "knots"]:
-        return 1.9438444924406
+        #return 1.9438444924406
+        return constants.knot
     elif unit in ["mph", "miles/h", "miles/hour"]:
-        return 2.2369362920544
+        #return 2.2369362920544
+        return constants.mph
     elif unit in ["kmh", "km/h", "kph"]:
-        return 3.6
+        #return 3.6
+        return constants.kmh
     elif unit in ["fpm", "f/m"]:
-        return 196.85039370078738
+        # return 196.85039370078738
+        return (constants.minute/constants.foot)
     elif unit in ["feet"]:
-        return 3.280839895013123
+        return constants.foot
+        #return 3.280839895013123
     elif unit in ["m/s", "mps", "m", "metres", "meters"]:
         return 1.0
     else:
@@ -104,8 +119,42 @@ def write_kml_colormaps(kmldoc):
     styles['polyline'].linestyle.width = 1
     styles['polyline'].polystyle.color = "7fffffff"
     styles['polyline']._id = "polyline"
+
+    # Style for thermalling phases (lime green)
+    styles['thermalling'] = simplekml.Style()
+    styles['thermalling'].linestyle.color = "ff20FF00"
+    styles['thermalling'].linestyle.width = 2
+    styles['thermalling']._id = "thermalling"
+
+    # Style for cruise phases (light blue)
+    styles['cruise'] = simplekml.Style()
+    styles['cruise'].linestyle.color = "ffDEFF00"
+    styles['cruise'].linestyle.width = 2
+    styles['cruise']._id = "cruise"
+
     for style in styles:
         kmldoc.styles.append(styles[style])
+
+def create_fixes(fix_records):
+
+    x_fixes = [fix['lat'] for fix in fix_records]
+    y_fixes = [fix['lon'] for fix in fix_records]
+    gps_alt_fixes = [fix['gps_alt'] for fix in fix_records]
+    pressure_alt_fixes = [fix['pressure_alt'] for fix in fix_records]
+    if statistics.stdev(pressure_alt_fixes) > 0: # We have pressure altitude information
+        meta_data['pressure_alt'] = 1
+    else: # We do not
+        meta_data['pressure_alt'] = 0
+    if meta_data['pressure_alt']:
+        # Altitude is calculated using both pressure and gps altitude, taking the average
+        data.alt = [(gps_alt + pressure_alt)/2 for gps_alt, pressure_alt in zip(gps_alt_fixes, pressure_alt_fixes)]
+    else:    # We have *no* pressure altitude information
+        data.alt = gps_alt_fixes
+
+    data.lat = x_fixes
+    data.lon = y_fixes
+
+    return data
 
 def process_data(parsed_igc_file, units):
 
@@ -118,8 +167,15 @@ def process_data(parsed_igc_file, units):
     y_fixes = [fix['lon'] for fix in parsed_igc_file['fix_records'][1]]
     gps_alt_fixes = [fix['gps_alt'] for fix in parsed_igc_file['fix_records'][1]]
     pressure_alt_fixes = [fix['pressure_alt'] for fix in parsed_igc_file['fix_records'][1]]
-    # Altitude is calculated using both pressure and gps altitude, taking the average
-    data.alt = [(gps_alt + pressure_alt)/2 for gps_alt, pressure_alt in zip(gps_alt_fixes, pressure_alt_fixes)]
+    if statistics.stdev(pressure_alt_fixes) > 0: # We have pressure altitude information
+        meta_data['pressure_alt'] = 1
+    else: # We do not
+        meta_data['pressure_alt'] = 0
+    if meta_data['pressure_alt']:
+        # Altitude is calculated using both pressure and gps altitude, taking the average
+        data.alt = [(gps_alt + pressure_alt)/2 for gps_alt, pressure_alt in zip(gps_alt_fixes, pressure_alt_fixes)]
+    else:    # We have *no* pressure altitude information
+        data.alt = gps_alt_fixes
     data.x = [EARTH_RADIUS * math.cos(lat * math.pi / 180) * math.cos(lon * math.pi / 180) for lat, lon in zip(x_fixes, y_fixes)]
     data.y = [EARTH_RADIUS * math.cos(lat * math.pi / 180) * math.sin(lon * math.pi / 180) for lat, lon in zip(x_fixes, y_fixes)]
 
@@ -198,17 +254,68 @@ def write_kml_timeseries(kmldoc, data, speed, units, colormap, n_colors, name=""
         line_string.style.linestyle.width = 2
     return
 
-def write_kml_path(kmldoc, data, extrude=0, polycolour="00000000", style="3", name="Curtain", description=None):
+def write_kml_path(kmldoc, data, extrude=0, style="3", name="Curtain", description=None, folder=None):
     # Keep all the simpleKML library usage in this function, so it's easier to switch to another library later if we need to
-    #kmldoc.document_name = "New Document"
+    # Put the path in the root, if no folder was supplied
+    if folder == None:
+        folder = kmldoc
     linestring_coords = [(lon, lat, alt) for lon, lat, alt in zip(data.lon, data.lat, data.alt)]
-    line_string = kmldoc.newlinestring(name=name, description=description, coords=linestring_coords)
+    line_string = folder.newlinestring(name=name, description=description, coords=linestring_coords)
     line_string.altitudemode = simplekml.AltitudeMode.absolute
     line_string.extrude = extrude
     # Pick out the style we're looking for from the list
-    style_picker = (s for s in kmldoc.styles if s.id == style)
-    style = next(style_picker)
-    line_string.style = style
+    for s in kmldoc.styles:
+        if s.id == style:
+            path_style = s
+            break
+    # style_picker = (s for s in kmldoc.styles if s.id == style)
+    # style = next(style_picker)
+    line_string.style = path_style
+
+def get_taskandtrip(task_data, fix_records):
+
+    # Ignore any waypoints without lat,lon data (some recorders do this for takeoff and landing)
+    waypoints = [Waypoint(name = wp['description'],
+                          latitude = float(wp['latitude']),
+                          longitude = float(wp['longitude']),
+                          r_min = None,
+                          r_max = 5000,
+                          angle_min = 0,
+                          angle_max = 180,
+                          is_line = False,
+                          sector_orientation = "fixed",
+                          orientation_angle = 0
+                          ) for wp in parsed_igc_file['task'][1]['waypoints'] if wp['latitude'] and wp['longitude']]
+
+    # task, _, _ = get_info_from_comment_lines(parsed_igc_file)
+    timezone = -5
+    start_opening = None
+    start_time = None
+    start_time_buffer = 0
+    multistart = False
+
+    task = RaceTask(waypoints, timezone, start_opening, start_time_buffer, multistart)
+    trip = Trip(task, parsed_igc_file['fix_records'][1])
+
+    return task, trip
+
+def plot_waypoints(kmldoc, task):
+
+    waypoint_folder = kmldoc.newfolder(name="Waypoints")
+    last_waypoint = len(task.waypoints) - 1
+    i = 0
+    for wp in task.waypoints:
+        if i < last_waypoint:
+            point = waypoint_folder.newpoint(name = wp.name, coords=[(wp.longitude, wp.latitude)])
+        else:   # This is the last waypoint. Check if it's equal to the first waypoint.
+            if task.waypoints[i] == task.waypoints[0]:
+                pass    # Don't plot the same waypoint twice
+            else:
+                point = waypoint_folder.newpoint(name = wp.name, coords=[(wp.longitude, wp.latitude)])
+        i += 1
+    # Plot start and finish waypoints, which may be identical and/or the same as the first waypoint
+    point = waypoint_folder.newpoint(name="START", coords=[(task.start.longitude, task.start.latitude)])
+    point = waypoint_folder.newpoint(name="FINISH", coords=[(task.finish.longitude, task.finish.latitude)])
 
 if __name__ == '__main__':
     units = Units()
@@ -236,17 +343,47 @@ if __name__ == '__main__':
     if meta_data['flight_date']:
         name += f": {meta_data['flight_date']}"
     kmldoc = kml.newdocument(name=name)
-    #kmldoc.name = name
-    print(kmldoc.name)
-    write_kml_colormaps(kmldoc)
 
+    write_kml_colormaps(kmldoc)
     write_kml_timeseries(kmldoc, data, data.speed, units, 'redtogreen', 9, f"Speed [{units.x}]", metric="speed")
     write_kml_timeseries(kmldoc, data, data.vario, units, 'redtogreen', 9, f"Vario [{units.y}]", metric="vario")
-
     # Adds an extruded 'curtain' between the flight-path and the ground to easier visualize altitude above ground.
-    write_kml_path(kmldoc, data, extrude=1, polycolour="7fffffff", style="polyline", name="Curtain", description="Right click to show elevation profile")
-    print("Saving...")
+    write_kml_path(kmldoc, data, extrude=1, style="polyline", name="Curtain", description="Right click to show elevation profile")
+
+    task, trip = get_taskandtrip(parsed_igc_file['task'][1], parsed_igc_file['fix_records'][1])
+    plot_waypoints(kmldoc, task)
+    # print("TASK:")
+    # pprint(vars(task))
+    # print("TRIP:")
+    # pprint(vars(trip))
+
+    phases = FlightPhases('pysoar', parsed_igc_file['fix_records'][1])
+    thermals_folder = kmldoc.newfolder(name="Thermals")
+    cruises_folder = kmldoc.newfolder(name="Cruises")
+    for phase in phases._phases:
+        if not phase.is_cruise:
+            fixes = create_fixes(phase.fixes)
+            write_kml_path(kmldoc, fixes, extrude=0, style="thermalling", name="Thermals", folder=thermals_folder)
+        if phase.is_cruise:
+            fixes = create_fixes(phase.fixes)
+            write_kml_path(kmldoc, fixes, extrude=0, style="cruise", name="Cruises", folder=cruises_folder)
+
     kml.save(outfile)
+
+# EXAMPLE TASK:
+# {'_waypoints': [<Waypoint lat=52.44638333333333, lon=6.341116666666666>,
+# <Waypoint lat=52.25, lon=6.158333333333333>,
+# <Waypoint lat=52.08166666666666, lon=6.446666666666666>,
+# <Waypoint lat=52.473333333333336, lon=6.41>,
+# <Waypoint lat=52.46888333333333, lon=6.333333333333333>],
+# 'distances': [25152.841688455122,
+#               27204.052228588032,
+#               43653.56790863828,
+#               5233.34288151257],
+# 'multistart': False,
+# 'start_opening': None,
+# 'start_time_buffer': 0,
+# 'timezone': 2}
 
 # logger_id
 # fix_records
