@@ -17,6 +17,7 @@ from opensoar.task.waypoint import Waypoint
 from opensoar.task.race_task import RaceTask
 from opensoar.task.task import Task
 from scipy import constants
+import random
 import pint # unit conversion library
 
 from fastkml import kml
@@ -37,6 +38,7 @@ class FlightData:
     speed: Optional[List[float]] = None
     timedelta: Optional[List[datetime.timedelta]] = None
     alt_delta: Optional[List[float]] = None
+    enl: Optional[List[float]] = None
 
     @property
     def n_samples(self):
@@ -55,11 +57,109 @@ EARTH_RADIUS = 6371e3 # radius of the earth in meters
 LAUNCH_SITES = {"Sonnwendstein": (47.622361, 15.8575),
                 'Hohe Wand': (47.829167, 16.041111),
                 'Invermere': (50.521301, -116.005644),
-                'York Soaring': (43.838098, -80.440351)}
+                'York Soaring': (43.838098, -80.440351),
+                'Pincher Creek': (49.520621, -114.000705)}
 
 def parse_igc(infile):
     with open(infile, 'r') as f:
         parsed_igc_file = Reader().read(f)
+        if args.verbose:
+            print("-"*100 + "\n|" + " "*38 + "BEFORE DATA PROCESSING" + " "*38 + "|\n" + "-"*100)
+            _debug_print_igc_file_info(parsed_igc_file)
+
+        # Pick ten fixes at random. If all ten have a seconds value of zero, chances are the seconds value is missing
+        # With a fix every five seconds, the chance is 1/1.615*10^11, so not zero, but ¯\_(ツ)_/¯
+        # Maybe hacky, maybe brilliant, maybe stupid. I dunno.
+        # TODO: The case for one fix per minute still needs to be considered
+        for i in range(10):
+            if random.choice(parsed_igc_file['fix_records'][1])['time'].second != 0:
+                break
+            parsed_igc_file = add_missing_seconds_to_fixes(parsed_igc_file)
+    return parsed_igc_file
+
+def remove_identical_items_from_start_and_and(lst):
+    # I shamelessly admit to using openai to solve this problem
+    start = 0
+    end = len(lst) - 1
+
+    # Find the index of the last item that is not identical to the first item
+    for i in range(len(lst)):
+        if lst[i]['time'] != lst[0]['time']:
+            start = i
+            break
+
+    # Find the index of the first item that is not identical to the last item
+    for i in range(len(lst)-1, -1, -1):
+        if lst[i]['time'] != lst[-1]['time']:
+            end = i
+            break
+
+    return lst[start:end+1]
+
+def add_missing_seconds_to_fixes(parsed_igc_file):
+    num_fixes = 0
+    t_minus1 = datetime.time(0)
+    num_time_deltas = 0
+    for fix in parsed_igc_file['fix_records'][1]:
+        num_fixes += 1
+        t = fix['time']
+        if t > t_minus1:
+            num_time_deltas += 1
+        t_minus1 = t
+
+    if args.verbose:
+        print(f"I count {num_fixes} fixes and {num_time_deltas} time deltas")
+    if num_fixes == num_time_deltas:
+        need_to_reprocess = False
+    else:
+        normalized_fixes = remove_identical_items_from_start_and_and(parsed_igc_file['fix_records'][1])
+        need_to_reprocess = True
+
+    # Estimate number of fixes per minute.
+    if need_to_reprocess:
+        num_fixes = 0
+        num_time_deltas = 0
+        i = 0
+        for fix in normalized_fixes:
+            num_fixes += 1
+            t = fix['time']
+            if 0 < i < len(normalized_fixes)-1:
+                time_plus1 = normalized_fixes[i+1]['time']
+                time = normalized_fixes[i]['time']
+                if time_plus1 > time:
+                    num_time_deltas += 1
+            i += 1
+    num_fixes = len(normalized_fixes) # Correct the length var, now that we've removed a few fixes
+
+    # Fill in the missing seconds with our previous estimate. Unfortunately, we can't do this
+    # without first iterating through the whole file to estimate fixes per minute.
+    if need_to_reprocess:
+        estimated_fixes_per_minute = round(num_fixes/num_time_deltas)   # NB: This is an **estimate**
+        fix_time_interval = int(60 / estimated_fixes_per_minute)
+        if args.verbose:
+            print(f"This is a fucky recorder. I estimate it takes a fix every {fix_time_interval} seconds.")
+        num_fixes = 0
+        num_time_deltas = 0
+        seconds = 0
+        normalized_fixes_with_seconds = []
+        for i, fix in enumerate(normalized_fixes.copy()):
+            t = fix['time']
+            if 0 < i < len(normalized_fixes)-1: # Ignore the first and last fix?
+                t_plus1 = normalized_fixes[i+1]['time']
+                t_minus1 = normalized_fixes[i-1]['time']
+                time = normalized_fixes[i]['time']
+                if t_minus1 < t_plus1:
+                    num_time_deltas += 1
+                    seconds = 0
+                # Discard any fixes that would have time.seconds greater than 59.
+                # This may lead to some fuckery when calculating speed, but ¯\_(ツ)_/¯
+                if seconds > 59:
+                    continue
+                normalized_fixes_with_seconds.append(normalized_fixes[i])
+                normalized_fixes_with_seconds[num_fixes]['time'] = time.replace(second=seconds)
+                num_fixes += 1
+                seconds += fix_time_interval
+    parsed_igc_file['fix_records'][1] = normalized_fixes_with_seconds
     return parsed_igc_file
 
 def get_nearest_launch_site_name(lat, lon):
@@ -78,6 +178,7 @@ def get_distance(lat1, lon1, lat2, lon2):
     return math.acos(a+b) * EARTH_RADIUS
 
 def get_conversion_factor(unit):
+    # TODO: See if we can get metres/second to feet/minute conversion in the scipy.constants library
     """Gets a conversion factor from metres per second (or simple metres) to whatever your heart desires"""
     # I bet there's a conversion library that would be better for this, but wtf, I can't find one
     if unit in ["kts", "knots"]:
@@ -91,7 +192,7 @@ def get_conversion_factor(unit):
         return constants.kmh
     elif unit in ["fpm", "f/m"]:
         # return 196.85039370078738
-        return (constants.minute/constants.foot)
+        return (constants.foot/constants.minute)
     elif unit in ["feet"]:
         return constants.foot
         #return 3.280839895013123
@@ -132,6 +233,12 @@ def write_kml_colormaps(kmldoc):
     styles['cruise'].linestyle.width = 2
     styles['cruise']._id = "cruise"
 
+    # Style for engine on phases (red)
+    styles['engine_on'] = simplekml.Style()
+    styles['engine_on'].linestyle.color = "ff0000ff"
+    styles['engine_on'].linestyle.width = 2
+    styles['engine_on']._id = "engine_on"
+
     for style in styles:
         kmldoc.styles.append(styles[style])
 
@@ -161,12 +268,18 @@ def process_data(parsed_igc_file, units):
     data = FlightData()
     meta_data = {}
     # I have no idea why there's an empty list as element zero...
-    #flight_date = parsed_igc_file['task'][1]['flight_date']
-    flight_date = parsed_igc_file['header'][1]['utc_date']
+    if "utc_date" in parsed_igc_file['header'][1]:
+        flight_date = parsed_igc_file['header'][1]['utc_date']
+    elif "declaration_date" in parsed_igc_file['task'][1]:
+        flight_date = parsed_igc_file['task'][1]['declaration_date']
+    else:
+        raise KeyError("Unable to determine flight date: neither utc_date is present in the header nor declaration_date in the task.")
+
     x_fixes = [fix['lat'] for fix in parsed_igc_file['fix_records'][1]]
     y_fixes = [fix['lon'] for fix in parsed_igc_file['fix_records'][1]]
     gps_alt_fixes = [fix['gps_alt'] for fix in parsed_igc_file['fix_records'][1]]
     pressure_alt_fixes = [fix['pressure_alt'] for fix in parsed_igc_file['fix_records'][1]]
+
     if statistics.stdev(pressure_alt_fixes) > 0: # We have pressure altitude information
         meta_data['pressure_alt'] = 1
     else: # We do not
@@ -176,6 +289,9 @@ def process_data(parsed_igc_file, units):
         data.alt = [(gps_alt + pressure_alt)/2 for gps_alt, pressure_alt in zip(gps_alt_fixes, pressure_alt_fixes)]
     else:    # We have *no* pressure altitude information
         data.alt = gps_alt_fixes
+
+    if "ENL" in parsed_igc_file['fix_records'][1]:
+        data.enl = [fix['ENL'] for fix in parsed_igc_file['fix_records'][1]]
     data.x = [EARTH_RADIUS * math.cos(lat * math.pi / 180) * math.cos(lon * math.pi / 180) for lat, lon in zip(x_fixes, y_fixes)]
     data.y = [EARTH_RADIUS * math.cos(lat * math.pi / 180) * math.sin(lon * math.pi / 180) for lat, lon in zip(x_fixes, y_fixes)]
 
@@ -204,9 +320,9 @@ def process_data(parsed_igc_file, units):
     meta_data['vario_mean'] = statistics.mean(data.vario)
     meta_data['launch_site'] = get_nearest_launch_site_name(parsed_igc_file['fix_records'][1][0]['lat'], parsed_igc_file['fix_records'][1][0]['lon'])
     meta_data['pilot'] = parsed_igc_file['header'][1]['pilot']
-    day = parsed_igc_file['header'][1]['utc_date'].day
-    month = parsed_igc_file['header'][1]['utc_date'].month
-    year =parsed_igc_file['header'][1]['utc_date'].year
+    day = flight_date.day
+    month = flight_date.month
+    year = flight_date.year
     meta_data['flight_date'] = f"{year}-{month}-{day}"
 
     units.xfactor = get_conversion_factor(units.x)
@@ -233,6 +349,8 @@ def write_kml_timeseries(kmldoc, data, speed, units, colormap, n_colors, name=""
     elif metric == "vario":
         factor = units.yfactor
         postfix = units.y
+    print(f"yunits: {postfix}")
+    print(f"yfactor: {factor}")
 
     for i in range(data.n_samples - 1):
         color = int(n_colors * (speed[i] - cmin) / (cmax - cmin) + 0.5)
@@ -240,7 +358,7 @@ def write_kml_timeseries(kmldoc, data, speed, units, colormap, n_colors, name=""
             color = n_colors - 1
         elif color < 0:
             color = 0
-        placemark_name = f'{data.t[i].hour}:{data.t[i].minute}:{data.t[i].second}, {data.alt[i]*units.altfactor:.0f}{units.alt}, {speed[i]*factor:.0f}{postfix}'
+        placemark_name = f'{data.t[i].hour}:{data.t[i].minute}:{data.t[i].second}, {data.alt[i]*units.altfactor:.0f}{units.alt}, {speed[i]/factor:.0f}{postfix}'
         line_string = line_string_folder.newlinestring(name=placemark_name, coords=(
             (data.lon[i], data.lat[i], data.alt[i]),
             (data.lon[i+1], data.lat[i+1], data.alt[i+1])
@@ -274,6 +392,7 @@ def write_kml_path(kmldoc, data, extrude=0, style="3", name="Curtain", descripti
 
 def get_taskandtrip(task_data, fix_records):
 
+    trip = None
     # Ignore any waypoints without lat,lon data (some recorders do this for takeoff and landing)
     waypoints = [Waypoint(name = wp['description'],
                           latitude = float(wp['latitude']),
@@ -295,7 +414,20 @@ def get_taskandtrip(task_data, fix_records):
     multistart = False
 
     task = RaceTask(waypoints, timezone, start_opening, start_time_buffer, multistart)
-    trip = Trip(task, parsed_igc_file['fix_records'][1])
+    started = False
+    start = None
+    for i, fix in enumerate(fix_records):
+        if i > 0:
+            started, fix, backwards = opensoar.task.task.Task.started(task, fix_records[i-1], fix)
+        if started:
+            break
+    if not started:
+        # We never made it to the start point, so use the second waypoint as the start instead.
+        if args.verbose:
+            print("Unable to determine start point")
+        start = waypoints[1]
+
+    trip = Trip(task, parsed_igc_file['fix_records'][1], start)
 
     return task, trip
 
@@ -317,24 +449,91 @@ def plot_waypoints(kmldoc, task):
     point = waypoint_folder.newpoint(name="START", coords=[(task.start.longitude, task.start.latitude)])
     point = waypoint_folder.newpoint(name="FINISH", coords=[(task.finish.longitude, task.finish.latitude)])
 
+def plot_fixes(kmldoc, trip):
+
+    fix_folder = kmldoc.newfolder(name="Fixes")
+    last_fix = len(trip.fixes) - 1
+    i = 1
+    for fix in trip.fixes:
+        name = f"FIX {i}"
+        if "comment" in fix:
+            name += "(" + fix['comment'] + ")"
+        point = fix_folder.newpoint(name = name, coords=[(fix['lon'], fix['lat'])])
+        i += 1
+
+def write_engine_on_path(kmldoc, data, style=None, description=None):
+
+    linestring_coords = [(lon, lat, alt) for lon, lat, alt, enl,t in zip(data.lon, data.lat, data.alt, data.enl, data.t) if enl > 50 and alt > 500]
+    folder = kmldoc.newfolder(name="Engine On")
+    line_string = folder.newlinestring(name=name, description=description, coords=linestring_coords)
+    line_string.altitudemode = simplekml.AltitudeMode.absolute
+    line_string.extrude = 0
+    # Pick out the style we're looking for from the list
+    for s in kmldoc.styles:
+        if s.id == style:
+            path_style = s
+            break
+    # style_picker = (s for s in kmldoc.styles if s.id == style)
+    # style = next(style_picker)
+    line_string.style = path_style
+
+def _debug_print_igc_file_info(parsed_igc_file, task=None, trip=None, meta_data=None):
+
+    # Prints various info from the parsed IGC file for use in analysis and debugging
+    print("-" * 100)
+    print("|" + " "*36 + "CONTENTS OF PARSED IGC FILE" + " "*35 + "|")
+    print("-" * 100)
+    for element in parsed_igc_file:
+        print(element)
+
+    print("-" * 100)
+    print("|" + " "*40 + "TASK FROM IGC FILE" + " "*40 + "|")
+    print("-" * 100)
+    pprint(parsed_igc_file['task'])
+
+    print("-" * 100)
+    print("|" + " "*39 + "HEADER FROM IGC FILE" + " "*39 + "|")
+    print("-" * 100)
+    pprint(parsed_igc_file['header'])
+
+    if task is not None:
+        print("-" * 100)
+        print("|" + " "*47 + "TASK" + " "*47 + "|")
+        print("-" * 100)
+        pprint(vars(task))
+
+    if trip is not None:
+        print("-" * 100)
+        print("|" + " "*47 + "TRIP" + " "*47 + "|")
+        print("-" * 100)
+        pprint(vars(trip))
+
+    if meta_data is not None:
+        print("-" * 100)
+        print("|" + " "*45 + "METADATA" + " "*45 + "|")
+        print("-" * 100)
+        pprint(meta_data)
+
 if __name__ == '__main__':
     units = Units()
     outfile = "newkml.kml"
     parser = argparse.ArgumentParser(description="IGC to KML converter for flight logs, so they can be viewed with Google Earth.")
-    parser.add_argument("input", nargs="+", help="Input file name(s)")
+    parser.add_argument("--input", "-i", help="Input file name", type=str)
+    parser.add_argument("--output", "-o", help="Output file name", type=str)
     parser.add_argument("--xunits", "-x", help="Ground speed units (default kmh)", type=str, choices=["kph", "m/s", "kmh", "mph", "kts", "knots", "miles/h"], default="kmh")
     parser.add_argument("--yunits", "-y", help="Vertical speed units (default mps)", type=str, choices=["m/s", "kmh", "mph", "kts", "fpm", "f/m"], default="m/s")
     parser.add_argument("--altunits", "-a", help="Altitude units (default m)", type=str, choices=["m", "feet", "metres", "metres"], default="m")
+    parser.add_argument("--skiptimeseries", "-s", help="Do not generate time series paths (useful to reduce processing time of larger files)", action="store_true", default=False)
+    parser.add_argument("--verbose", "-v", help="Verbose debugging output", action="store_true", default=False)
     args = parser.parse_args()
     units.x = args.xunits
     units.y = args.yunits
     units.alt = args.altunits
     args = parser.parse_args()
 
-    for input_fname in args.input:
-        parsed_igc_file = parse_igc(input_fname)
-        # Returns multiple lists of fixes, time, deltas, etc
-        data, meta_data, units = process_data(parsed_igc_file, units)
+    parsed_igc_file = parse_igc(args.input)
+    # Returns multiple lists of fixes, time, deltas, etc
+    data, meta_data, units = process_data(parsed_igc_file, units)
 
     kml = simplekml.Kml()
     name = meta_data['launch_site']
@@ -345,15 +544,32 @@ if __name__ == '__main__':
     kmldoc = kml.newdocument(name=name)
 
     write_kml_colormaps(kmldoc)
-    write_kml_timeseries(kmldoc, data, data.speed, units, 'redtogreen', 9, f"Speed [{units.x}]", metric="speed")
-    write_kml_timeseries(kmldoc, data, data.vario, units, 'redtogreen', 9, f"Vario [{units.y}]", metric="vario")
+    if not args.skiptimeseries:
+        write_kml_timeseries(kmldoc, data, data.speed, units, 'redtogreen', 9, f"Speed [{units.x}]", metric="speed")
+        write_kml_timeseries(kmldoc, data, data.vario, units, 'redtogreen', 9, f"Vario [{units.y}]", metric="vario")
     # Adds an extruded 'curtain' between the flight-path and the ground to easier visualize altitude above ground.
     write_kml_path(kmldoc, data, extrude=1, style="polyline", name="Curtain", description="Right click to show elevation profile")
 
-    task, trip = get_taskandtrip(parsed_igc_file['task'][1], parsed_igc_file['fix_records'][1])
-    plot_waypoints(kmldoc, task)
+    # The returned data will have a "waypoints" dict, even if it's empty.
+    # If there's no other task data, this will result in a task[1] dict with a single, empty element
+    trip = None
+    if len(parsed_igc_file['task'][1]) > 1:
+        task, trip = get_taskandtrip(parsed_igc_file['task'][1], parsed_igc_file['fix_records'][1])
+        plot_waypoints(kmldoc, task)
+    else:
+        print("No task data")
+
+    if args.verbose:
+        _debug_print_igc_file_info(parsed_igc_file, task, trip, meta_data)
+
+    # print("Waypoints:")
+    # pprint(task.waypoints)
+    # print("Fixes:")
+    # pprint(trip.fixes)
+    # print("HEADERS:")
+    # pprint(parsed_igc_file['header'])
     # print("TASK:")
-    # pprint(vars(task))
+    # pprint(parsed_igc_file['task'])
     # print("TRIP:")
     # pprint(vars(trip))
 
@@ -368,7 +584,14 @@ if __name__ == '__main__':
             fixes = create_fixes(phase.fixes)
             write_kml_path(kmldoc, fixes, extrude=0, style="cruise", name="Cruises", folder=cruises_folder)
 
-    kml.save(outfile)
+    if len(parsed_igc_file['task'][1]) > 1 and trip is not None:
+        plot_fixes(kmldoc, trip)
+
+    if "ENL" in parsed_igc_file['fix_records'][1]:
+        write_engine_on_path(kmldoc, data, style="engine_on")
+
+
+    kml.save(args.output)
 
 # EXAMPLE TASK:
 # {'_waypoints': [<Waypoint lat=52.44638333333333, lon=6.341116666666666>,
