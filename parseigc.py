@@ -1,4 +1,8 @@
 #!/usr/bin/python3
+import itertools
+
+import geopy.distance
+import pandas as pd
 
 from aerofiles.igc import Reader
 import datetime
@@ -18,6 +22,7 @@ from opensoar.task.race_task import RaceTask
 from opensoar.task.task import Task
 from scipy import constants
 import random
+import numpy
 import pint # unit conversion library
 
 from fastkml import kml
@@ -65,16 +70,18 @@ def parse_igc(infile):
         parsed_igc_file = Reader().read(f)
         if args.verbose:
             print("-"*100 + "\n|" + " "*38 + "BEFORE DATA PROCESSING" + " "*38 + "|\n" + "-"*100)
-            _debug_print_igc_file_info(parsed_igc_file)
-
-        # Pick ten fixes at random. If all ten have a seconds value of zero, chances are the seconds value is missing
+        # Pick ten fixes at random. If all ten have a seconds value of zero, chances are the seconds value is missing.
         # With a fix every five seconds, the chance is 1/1.615*10^11, so not zero, but ¯\_(ツ)_/¯
         # Maybe hacky, maybe brilliant, maybe stupid. I dunno.
         # TODO: The case for one fix per minute still needs to be considered
-        for i in range(10):
+        timestamps_include_seconds = False
+        for i in range(1,10):
             if random.choice(parsed_igc_file['fix_records'][1])['time'].second != 0:
+                timestamps_include_seconds = True
                 break
-            parsed_igc_file = add_missing_seconds_to_fixes(parsed_igc_file)
+        if not timestamps_include_seconds:
+            parsed_igc_file = interpolate_seconds(parsed_igc_file)
+
     return parsed_igc_file
 
 def remove_identical_items_from_start_and_and(lst):
@@ -96,7 +103,54 @@ def remove_identical_items_from_start_and_and(lst):
 
     return lst[start:end+1]
 
+def interpolate_seconds(parsed_igc_file):
+
+    normalized_fixes = remove_identical_items_from_start_and_and(parsed_igc_file['fix_records'][1])
+
+    if "utc_date" in parsed_igc_file['header'][1]:
+        flight_date = parsed_igc_file['header'][1]['utc_date']
+    elif "declaration_date" in parsed_igc_file['task'][1]:
+        flight_date = parsed_igc_file['task'][1]['declaration_date']
+    else:
+        raise KeyError("Unable to determine flight date: neither utc_date is present in the header nor declaration_date in the task.")
+
+    result = []
+    time = datetime.datetime.combine(flight_date, normalized_fixes[0]['time'])
+    current_minute = time.minute
+    last_timestamp = time
+    num_timestamps = 0
+    current_minute_timestaps_start = 0  # Pointer to start of the current set of timestamps
+    all_fixes = parsed_igc_file['fix_records'][1]
+
+    for i, fix in enumerate(normalized_fixes):
+        num_timestamps += 1
+        time = datetime.datetime.combine(flight_date, fix['time'])
+        current_minute = time.minute
+        if i+2 > len(normalized_fixes):
+            break
+        next_minute = normalized_fixes[i+1]['time'].minute
+        if next_minute > current_minute:
+            j = 0
+            new_time = datetime.datetime.combine(flight_date, normalized_fixes[current_minute_timestaps_start]['time'])
+            seconds_per_fix = 60/num_timestamps
+            while j < num_timestamps-1:
+                seconds = j*seconds_per_fix
+                newfix = normalized_fixes[i+j].copy()
+                newfix['time'] = (time + datetime.timedelta(0,seconds)).time()
+                result.append(newfix)
+                # print(f"Appending {(new_time + datetime.timedelta(0,seconds))}; j={j}; num_timestamps: {num_timestamps}; current_minute: {current_minute}")
+                j += 1
+
+            num_timestamps = 0
+
+        current_minute_timestaps_start = i
+
+    parsed_igc_file['fix_records'][1] = result
+
+    return parsed_igc_file
+
 def add_missing_seconds_to_fixes(parsed_igc_file):
+    # DEPRECATED. Wrote a better algorithm.
     num_fixes = 0
     t_minus1 = datetime.time(0)
     num_time_deltas = 0
@@ -196,6 +250,8 @@ def get_conversion_factor(unit):
     elif unit in ["feet"]:
         return constants.foot
         #return 3.280839895013123
+    elif unit in ["miles", ",mile"]:
+        return constants.mile
     elif unit in ["m/s", "mps", "m", "metres", "meters"]:
         return 1.0
     else:
@@ -331,6 +387,34 @@ def process_data(parsed_igc_file, units):
 
     return data, meta_data, units
 
+def avg_alt(parsed_igc_file, meta_data):
+
+    # Adds a "corrected_alt" entry to the fix_records list which averages gps_alt and pressure_alt
+    # Assumes that all flight recorders record GPS altitude
+
+    if meta_data['pressure_alt']:   # We have pressure altitude information
+        for fix in parsed_igc_file['fix_records'][1]:
+            corrected_alt = (fix['pressure_alt'] + fix['gps_alt']) / 2
+            fix['corrected_alt'] = int(corrected_alt)
+    else:   # We do not have pressure altitude information. Just make it equal to GPS alt.
+        for fix in parsed_igc_file['fix_records'][1]:
+            fix['corrected_alt'] = fix['gps_alt']
+
+    return parsed_igc_file
+
+def total_distance(flight_data):
+    fixes = parsed_igc_file['fix_records'][1]
+    total_distance = geopy.distance.Distance(meters=0)
+
+    for i, fix in enumerate(fixes):
+        if i+1 >= len(fixes) - 1:
+            break
+        next_fix = fixes[i+1]
+        distance_2d = geopy.distance.geodesic( (fix['lat'], fix['lon']), (next_fix['lat'], next_fix['lon']))
+        distance_3d = geopy.distance.Distance(meters=numpy.sqrt( distance_2d.meters**2 + (fix['corrected_alt'] - next_fix['corrected_alt'])**2) )
+        total_distance += distance_3d
+
+    return round(total_distance.m)
 def write_kml_timeseries(kmldoc, data, speed, units, colormap, n_colors, name="", metric="speed"):
 
     line_string_folder = kmldoc.newfolder(name=name)
@@ -341,6 +425,8 @@ def write_kml_timeseries(kmldoc, data, speed, units, colormap, n_colors, name=""
     speed_stddev = statistics.stdev(getattr(data,metric))
     cmin = speed_mean - speed_stddev
     cmax = speed_mean + speed_stddev
+    postfix = "unknown"
+    factor = 1
 
     # Figure out the factor we need to multiply by
     if metric == "speed":
@@ -349,8 +435,6 @@ def write_kml_timeseries(kmldoc, data, speed, units, colormap, n_colors, name=""
     elif metric == "vario":
         factor = units.yfactor
         postfix = units.y
-    print(f"yunits: {postfix}")
-    print(f"yfactor: {factor}")
 
     for i in range(data.n_samples - 1):
         color = int(n_colors * (speed[i] - cmin) / (cmax - cmin) + 0.5)
@@ -358,7 +442,7 @@ def write_kml_timeseries(kmldoc, data, speed, units, colormap, n_colors, name=""
             color = n_colors - 1
         elif color < 0:
             color = 0
-        placemark_name = f'{data.t[i].hour}:{data.t[i].minute}:{data.t[i].second}, {data.alt[i]*units.altfactor:.0f}{units.alt}, {speed[i]/factor:.0f}{postfix}'
+        placemark_name = f'{data.t[i].hour}:{data.t[i].minute}:{data.t[i].second}, {data.alt[i]/units.altfactor:.0f}{units.alt}, {speed[i]/factor:.0f}{postfix}'
         line_string = line_string_folder.newlinestring(name=placemark_name, coords=(
             (data.lon[i], data.lat[i], data.alt[i]),
             (data.lon[i+1], data.lat[i+1], data.alt[i+1])
@@ -534,6 +618,7 @@ if __name__ == '__main__':
     parsed_igc_file = parse_igc(args.input)
     # Returns multiple lists of fixes, time, deltas, etc
     data, meta_data, units = process_data(parsed_igc_file, units)
+    parsed_igc_file = avg_alt(parsed_igc_file, meta_data)
 
     kml = simplekml.Kml()
     name = meta_data['launch_site']
@@ -562,17 +647,6 @@ if __name__ == '__main__':
     if args.verbose:
         _debug_print_igc_file_info(parsed_igc_file, task, trip, meta_data)
 
-    # print("Waypoints:")
-    # pprint(task.waypoints)
-    # print("Fixes:")
-    # pprint(trip.fixes)
-    # print("HEADERS:")
-    # pprint(parsed_igc_file['header'])
-    # print("TASK:")
-    # pprint(parsed_igc_file['task'])
-    # print("TRIP:")
-    # pprint(vars(trip))
-
     phases = FlightPhases('pysoar', parsed_igc_file['fix_records'][1])
     thermals_folder = kmldoc.newfolder(name="Thermals")
     cruises_folder = kmldoc.newfolder(name="Cruises")
@@ -590,7 +664,11 @@ if __name__ == '__main__':
     if "ENL" in parsed_igc_file['fix_records'][1]:
         write_engine_on_path(kmldoc, data, style="engine_on")
 
-
+    model = parsed_igc_file['header'][1]['glider_model']
+    registration = parsed_igc_file['header'][1]['glider_registration']
+    total_distance = total_distance(data)
+    # TODO: use the units struct to print distance travelled better, eg. if xunits is kts then distance should be measured in nautical miles
+    kmldoc.description = (f"{model} ({registration}) - {round((total_distance)/get_conversion_factor('miles'))} miles")
     kml.save(args.output)
 
 # EXAMPLE TASK:
